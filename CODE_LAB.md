@@ -85,6 +85,13 @@ pip install -r requirements.txt
 python app.py
 ```
 
+> 🪟 **Windows:** nếu `/ask` trả về `500 Internal Server Error` với `UnicodeEncodeError: 'charmap' codec...`, đó là do `print()` ghi tiếng Việt ra console `cp1252`. Chạy với:
+> ```bash
+> set PYTHONIOENCODING=utf-8   # cmd
+> $env:PYTHONIOENCODING="utf-8"; python app.py   # PowerShell
+> ```
+> Đây cũng là một ví dụ thực tế cho lý do tại sao `print()` không nên dùng trong production (Vấn đề 3) — `logging` không gặp lỗi này.
+
 Test:
 ```bash
 curl -X POST "http://localhost:8000/ask?question=hello"
@@ -173,13 +180,15 @@ cd ../production
 ```
 
 **Nhiệm vụ:** Đọc `Dockerfile` và tìm:
-- Stage 1 làm gì?
-- Stage 2 làm gì?
+- Stage 1 (`builder`) làm gì?
+- Stage 2 (`runtime`) làm gì?
 - Tại sao image nhỏ hơn?
+- Tại sao có `USER appuser` ở stage 2?
 
-Build và so sánh:
+Build và so sánh (chạy từ **project root**, vì Dockerfile `COPY` các file dùng đường dẫn tương đối tới root):
 ```bash
-docker build -t my-agent:advanced .
+cd ../..
+docker build -f 02-docker/production/Dockerfile -t my-agent:advanced .
 docker images | grep my-agent
 ```
 
@@ -187,11 +196,21 @@ docker images | grep my-agent
 
 **Nhiệm vụ:** Đọc `docker-compose.yml` và vẽ architecture diagram.
 
+> `env_file: .env.local` được khai báo nhưng file này không commit vào git (xem `.gitignore`).
+> Tạo trước file rỗng `02-docker/production/.env.local` nếu Docker Compose báo lỗi "file not found".
+
 ```bash
 docker compose up
 ```
 
 Services nào được start? Chúng communicate thế nào?
+
+<details>
+<summary> Gợi ý đáp án</summary>
+
+4 services: `agent` (FastAPI, không expose port — chỉ nginx gọi được), `redis` (session/rate-limit cache), `qdrant` (vector DB cho RAG), `nginx` (reverse proxy + load balancer, expose port 80/443). Tất cả communicate qua network nội bộ `internal`; client chỉ thấy nginx.
+
+</details>
 
 Test:
 ```bash
@@ -273,13 +292,15 @@ railway domain
 Test:
 ```bash
 # Health check
-curl http://student-agent-domain/health
+curl https://<your-app>.up.railway.app/health
 
 # Agent endpoint
-curl http://studen-agent-domain/ask -X POST \
+curl https://<your-app>.up.railway.app/ask -X POST \
   -H "Content-Type: application/json" \
-  -d '{"question": ""}'
+  -d '{"question": "What is Docker?"}'
 ```
+
+> Thay `<your-app>.up.railway.app` bằng domain thật lấy từ `railway domain` ở bước 6.
 
 ###  Exercise 3.2: Deploy Render (15 phút)
 
@@ -342,19 +363,25 @@ cd ../../04-api-gateway/develop
 
 Test:
 ```bash
-python app.py
-
-#  Không có key
-curl http://localhost:8000/ask -X POST \
-  -H "Content-Type: application/json" \
-  -d '{"question": "Hello"}'
-
-#  Có key
-curl http://localhost:8000/ask -X POST \
-  -H "X-API-Key: secret-key-123" \
-  -H "Content-Type: application/json" \
-  -d '{"question": "Hello"}'
+AGENT_API_KEY=secret-key-123 python app.py
 ```
+
+> ⚠️ `question` ở endpoint `/ask` là **query parameter** (không phải JSON body), vì handler nhận `question: str` trực tiếp — không qua Pydantic model. Vì vậy gửi `?question=...` trên URL, không phải `-d '{"question": ...}'`.
+
+```bash
+#  Không có key → 401
+curl -X POST "http://localhost:8000/ask?question=Hello"
+
+#  Có key nhưng sai → 403
+curl -X POST "http://localhost:8000/ask?question=Hello" \
+  -H "X-API-Key: wrong-key"
+
+#  Có key đúng → 200
+curl -X POST "http://localhost:8000/ask?question=Hello" \
+  -H "X-API-Key: secret-key-123"
+```
+
+> 💡 Muốn xem một implementation hoàn chỉnh (header `X-API-Key`, JWT, rate limiting, cost guard cùng lúc)? Tham khảo `04-api-gateway/production/`.
 
 ###  Exercise 4.2: JWT authentication (Advanced)
 
@@ -384,7 +411,7 @@ curl http://localhost:8000/ask -X POST \
 
 ###  Exercise 4.3: Rate limiting
 
-**Nhiệm vụ:** Đọc `rate_limiter.py` và trả lời:
+**Nhiệm vụ:** Đọc `rate_limiter.py` (trong `04-api-gateway/production/`) và trả lời:
 - Algorithm nào được dùng? (Token bucket? Sliding window?)
 - Limit là bao nhiêu requests/minute?
 - Làm sao bypass limit cho admin?
@@ -534,20 +561,18 @@ def shutdown_handler(signum, frame):
 signal.signal(signal.SIGTERM, shutdown_handler)
 ```
 
-Test:
+Test (Linux/macOS hoặc WSL — trên Windows, `kill -TERM` không gửi tín hiệu thật cho process Python nên uvicorn sẽ không chạy graceful shutdown; đây cũng là lý do production luôn deploy trên container Linux):
 ```bash
 python app.py &
 PID=$!
 
-# Gửi request
-curl http://localhost:8000/ask -X POST \
-  -H "Content-Type: application/json" \
-  -d '{"question": "Long task"}' &
+# Gửi request — chú ý "question" là query param
+curl -X POST "http://localhost:8000/ask?question=Long+task" &
 
 # Ngay lập tức kill
 kill -TERM $PID
 
-# Quan sát: Request có hoàn thành không?
+# Quan sát: Request có hoàn thành không? Log có in "Graceful shutdown" không?
 ```
 
 ###  Exercise 5.3: Stateless design
@@ -580,28 +605,60 @@ def ask(user_id: str, question: str):
 
 Tại sao? Vì khi scale ra nhiều instances, mỗi instance có memory riêng.
 
+> 💡 Test nhanh không cần Docker/Redis: chạy `python app.py` trong `05-scaling-reliability/production`. Nếu không có Redis, app tự fallback sang in-memory dict (log "⚠️ Redis not available"). Gọi `POST /chat` với `{"question": "Hello"}`, lấy `session_id` từ response, gửi tiếp `POST /chat` với cùng `session_id` → `GET /chat/{session_id}/history` để xem history được giữ qua nhiều turns.
+
+> 💡 **Không có Docker?** Mô phỏng "nhiều instance" bằng cách chạy 2 process `app.py` trên 2 port khác nhau, mỗi process một `INSTANCE_ID`:
+> ```bash
+> # Terminal 1
+> INSTANCE_ID=instance-A PORT=8101 python app.py
+> # Terminal 2
+> INSTANCE_ID=instance-B PORT=8102 python app.py
+> ```
+> Sau đó:
+> ```bash
+> # Turn 1 -> instance A, tạo session mới
+> curl -s -X POST http://localhost:8101/chat -H "Content-Type: application/json" \
+>   -d '{"question": "Xin chao, toi ten la An"}'
+> # Lấy session_id từ response, gửi turn 2 vẫn tới instance A
+> curl -s -X POST http://localhost:8101/chat -H "Content-Type: application/json" \
+>   -d '{"question": "Docker la gi?", "session_id": "<session_id>"}'
+> # Turn 3 -> CÙNG session_id nhưng gửi tới instance B (port khác)
+> curl -s -X POST http://localhost:8102/chat -H "Content-Type: application/json" \
+>   -d '{"question": "Ban nho ten toi khong?", "session_id": "<session_id>"}'
+> # So sánh history trên từng instance
+> curl -s http://localhost:8101/chat/<session_id>/history
+> curl -s http://localhost:8102/chat/<session_id>/history
+> ```
+> Không có Redis → mỗi instance dùng `_memory_store` riêng. Instance B sẽ KHÔNG thấy history của A (`turn` reset về 1, `served_by: instance-B`), và `history` của A/B sẽ khác nhau hoàn toàn cho cùng `session_id`. Đây chính là bug "mất session khi scale" mà Redis (Exercise 5.4 với Docker) giải quyết — Nginx load balancer + nhiều instance thật sẽ tái hiện đúng vấn đề này ở quy mô lớn hơn.
+
 ###  Exercise 5.4: Load balancing
 
 **Nhiệm vụ:** Chạy stack với Nginx load balancer:
 
+> Nếu Docker Compose báo lỗi thiếu `.env.local`, tạo trước một file rỗng `05-scaling-reliability/production/.env.local` (file này bị gitignore).
+
 ```bash
 docker compose up --scale agent=3
 ```
+
+Lưu ý: `docker-compose.yml` đã định nghĩa `deploy.replicas: 3`, nên `--scale agent=3` chỉ để minh hoạ — bạn có thể đổi số lượng instance để quan sát.
 
 Quan sát:
 - 3 agent instances được start
 - Nginx phân tán requests
 - Nếu 1 instance die, traffic chuyển sang instances khác
 
-Test:
+Test (chú ý: Nginx expose ở port **8080**, endpoint là `/chat` không phải `/ask`):
 ```bash
 # Gọi 10 requests
 for i in {1..10}; do
-  curl http://localhost/ask -X POST \
+  curl http://localhost:8080/chat -X POST \
     -H "Content-Type: application/json" \
     -d '{"question": "Request '$i'"}'
+  echo ""
 done
 
+# Mỗi response có field "served_by" — instance nào xử lý request
 # Check logs — requests được phân tán
 docker compose logs agent
 ```
@@ -632,6 +689,8 @@ Script này:
 ###  Objective
 
 Build một production-ready AI agent từ đầu, kết hợp TẤT CẢ concepts đã học.
+
+> 💡 Bị kẹt? `06-lab-complete/` chứa một reference solution đầy đủ (`app/main.py`, `app/config.py`, `Dockerfile`, `docker-compose.yml`, `railway.toml`, `render.yaml`, `check_production_ready.py`). Cố gắng tự làm trước, sau đó so sánh với solution để học cách implement.
 
 ###  Requirements
 
@@ -849,23 +908,39 @@ railway up
 
 Chạy script kiểm tra:
 
+Copy script vào project của bạn (`my-production-agent/`) rồi chạy:
+
 ```bash
-cd 06-lab-complete
+cp 06-lab-complete/check_production_ready.py my-production-agent/
+cd my-production-agent
 python check_production_ready.py
 ```
 
-Script sẽ kiểm tra:
--  Dockerfile exists và valid
--  Multi-stage build
--  .dockerignore exists
--  Health endpoint returns 200
--  Readiness endpoint returns 200
--  Auth required (401 without key)
--  Rate limiting works (429 after limit)
--  Cost guard works (402 when exceeded)
--  Graceful shutdown (SIGTERM handled)
--  Stateless (state trong Redis, không trong memory)
--  Structured logging (JSON format)
+Script kiểm tra static (đọc code/files, không cần server đang chạy):
+
+**📁 Required Files**
+-  Dockerfile, docker-compose.yml, .dockerignore, .env.example, requirements.txt exist
+-  railway.toml hoặc render.yaml exists
+
+**🔒 Security**
+-  `.env` có trong `.gitignore`
+-  Không có secrets hardcode trong `app/main.py`, `app/config.py`
+
+**🌐 API Endpoints** (đọc `app/main.py`)
+-  `/health` và `/ready` endpoints defined
+-  Authentication implemented (api_key / verify_token)
+-  Rate limiting implemented (429)
+-  Graceful shutdown (SIGTERM)
+-  Structured logging (JSON — `json.dumps`)
+
+**🐳 Docker**
+-  Multi-stage build (`AS builder` / `AS runtime`)
+-  Non-root user (`USER`)
+-  HEALTHCHECK instruction
+-  Slim/alpine base image
+-  `.dockerignore` covers `.env` và `__pycache__`
+
+Chạy `python check_production_ready.py` trong `06-lab-complete/` sẽ cho **100%** — đó là baseline để so sánh.
 
 ###  Grading Rubric
 
